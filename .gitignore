@@ -4,3 +4,4 @@ __pycache__/
 *.pyc
 app.py.backup-*
 downloaded-product-images/
+.browser-sessions/
