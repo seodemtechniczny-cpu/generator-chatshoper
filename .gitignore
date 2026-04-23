@@ -1,3 +1,6 @@
 .venv/
 __pycache__/
 .DS_Store
+*.pyc
+app.py.backup-*
+downloaded-product-images/
