@@ -1086,10 +1086,24 @@ def fetch_html(url):
 
 
 def detect_waf_vendor_from_html(raw_html):
-    blob = ascii_fold(safe_str(raw_html)).lower()
+    raw_text = safe_str(raw_html)
+    blob = ascii_fold(raw_text).lower()
+    title = ascii_fold(extract_html_title(raw_text)).lower()
     if "waffailoverassets" in blob or "automatycznie wykryty alert zwiazany z bezpieczenstwem" in blob:
         return "akamai"
-    if "cloudflare" in blob or "just a moment" in blob or "attention required!" in blob or "cf-browser-verification" in blob:
+    cloudflare_challenge_markers = [
+        "just a moment",
+        "attention required!",
+        "cf-browser-verification",
+        "challenge-error-text",
+        "_cf_chl_opt",
+        "/cdn-cgi/challenge-platform/",
+        "enable javascript and cookies to continue",
+        "cf-chl-",
+    ]
+    if title in {"just a moment...", "attention required! | cloudflare"}:
+        return "cloudflare"
+    if any(marker in blob for marker in cloudflare_challenge_markers):
         return "cloudflare"
     return ""
 
