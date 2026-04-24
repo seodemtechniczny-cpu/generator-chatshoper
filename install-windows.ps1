@@ -101,6 +101,7 @@ $venvPython = Join-Path $InstallDir ".venv\Scripts\python.exe"
 Write-Step "Instaluje biblioteki z requirements.txt"
 & $venvPython -m pip install --upgrade pip
 & $venvPython -m pip install -r "$InstallDir\requirements.txt"
+& $venvPython -m playwright install chromium
 
 $launcherPath = Join-Path $InstallDir "start-generator-chatshoper.cmd"
 $launcherBody = @"

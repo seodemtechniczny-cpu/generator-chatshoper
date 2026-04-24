@@ -1,29 +1,60 @@
 # -*- coding: utf-8 -*-
 import base64
 import csv
+import hashlib
 import html
 import io
 import json
 import math
+import os
 import re
+import shlex
 import shutil
+import socket
+import ssl
 import subprocess
+import struct
+import sys
 import tempfile
 import time
 import unicodedata
 from collections import Counter, defaultdict
 from datetime import datetime
 from pathlib import Path
-from urllib.parse import urljoin, urlparse
+from urllib.parse import quote, urljoin, urlparse
+
+
+def add_local_venv_site_packages():
+    root = Path(__file__).resolve().parent
+    candidates = sorted((root / ".venv" / "lib").glob("python*/site-packages"))
+    for candidate in candidates:
+        text = str(candidate)
+        if candidate.exists() and text not in sys.path:
+            sys.path.append(text)
+
+
+add_local_venv_site_packages()
 
 import requests
 import streamlit as st
 from bs4 import BeautifulSoup
 
-try:
-    import anthropic
-except Exception:
-    anthropic = None
+anthropic = None
+anthropic_import_error = ""
+
+
+def get_anthropic_module():
+    global anthropic, anthropic_import_error
+    if anthropic is not None:
+        return anthropic
+    try:
+        import anthropic as anthropic_module
+        anthropic = anthropic_module
+        anthropic_import_error = ""
+        return anthropic
+    except Exception as exc:
+        anthropic_import_error = safe_str(exc)
+        return None
 
 USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -68,11 +99,14 @@ JSON_REPAIR_SYSTEM_PROMPT = (
     "Jesli description zawiera HTML, zachowaj go jako string JSON z poprawnie escapowanymi cudzyslowami."
 )
 
-MODEL_OPTIONS = [
+DEFAULT_MODEL_OPTIONS = [
     "claude-sonnet-4-6",
     "claude-opus-4-6",
     "claude-haiku-4-5-20251001",
 ]
+MODEL_OPTIONS_ENV = "GENERATOR_CHATSHOPER_MODELS"
+SCRAPE_CACHE_DIRNAME = ".scrape-cache"
+PROJECT_SCHEMA_VERSION = 1
 
 RAW_CATEGORIES = [
     "Pojazdy elektryczne > Dla dzieci i młodzieży",
@@ -141,6 +175,31 @@ def slugify(text):
     return text[:80]
 
 
+def normalize_navigation_url(url):
+    text = safe_str(url).strip()
+    if not text:
+        return ""
+    parsed = urlparse(text)
+    if not parsed.scheme or not parsed.netloc:
+        return text.rstrip("/")
+    normalized = parsed._replace(
+        scheme=parsed.scheme.lower(),
+        netloc=parsed.netloc.lower(),
+        fragment="",
+    ).geturl()
+    return normalized.rstrip("/")
+
+
+def should_navigate_to_requested_url(current_url, requested_url):
+    current = safe_str(current_url).strip()
+    requested = safe_str(requested_url).strip()
+    if not current:
+        return True
+    if current.startswith(("about:", "chrome://", "devtools://")):
+        return True
+    return normalize_navigation_url(current) != normalize_navigation_url(requested)
+
+
 def parse_float(value):
     if value is None or value == "":
         return None
@@ -154,18 +213,26 @@ def parse_float(value):
     text = re.sub(r"(?<=\d)\s+(?=\d{3}(\D|$))", "", text)
     text = text.strip()
 
-    match = re.search(r"(-?\d+(?:[.,]\d+)?)", text)
+    match = re.search(r"(-?\d[\d\s.,]*)", text)
     if not match:
         return None
 
-    number = match.group(1)
+    number = re.sub(r"\s+", "", match.group(1).strip())
     if "," in number and "." in number:
         if number.rfind(",") > number.rfind("."):
             number = number.replace(".", "").replace(",", ".")
         else:
             number = number.replace(",", "")
+    elif "." in number:
+        parts = number.split(".")
+        if len(parts) > 2 or (len(parts) == 2 and len(parts[1]) == 3):
+            number = number.replace(".", "")
     else:
-        number = number.replace(",", ".")
+        parts = number.split(",")
+        if len(parts) > 2 or (len(parts) == 2 and len(parts[1]) == 3):
+            number = number.replace(",", "")
+        else:
+            number = number.replace(",", ".")
 
     try:
         return float(number)
@@ -234,6 +301,40 @@ def make_response_preview(raw_text, limit=2000):
 def sanitize_filename_component(text, fallback="plik"):
     slug = re.sub(r"[^A-Za-z0-9._-]+", "-", ascii_fold(text)).strip("-._")
     return (slug[:80] or fallback).strip("-._") or fallback
+
+
+def short_hash(text, length=10):
+    digest = hashlib.sha1(safe_str(text).encode("utf-8", "replace")).hexdigest()
+    return digest[: max(6, int(length))]
+
+
+def get_model_options():
+    raw = os.getenv(MODEL_OPTIONS_ENV, "")
+    try:
+        if not raw:
+            raw = safe_str(st.secrets.get(MODEL_OPTIONS_ENV, ""))
+    except Exception:
+        raw = ""
+    models = [normalize_whitespace(item) for item in raw.split(",") if normalize_whitespace(item)]
+    return models or list(DEFAULT_MODEL_OPTIONS)
+
+
+def cache_scrape_html(url, html_text, stage="fetch"):
+    text = safe_str(html_text)
+    if not text:
+        return ""
+    try:
+        cache_root = Path.cwd() / SCRAPE_CACHE_DIRNAME
+        cache_root.mkdir(parents=True, exist_ok=True)
+        parsed = urlparse(safe_str(url))
+        domain = sanitize_filename_component(parsed.netloc or "unknown", fallback="unknown")
+        filename = f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-{sanitize_filename_component(stage, 'fetch')}-{short_hash(url + text, 12)}.html"
+        path = cache_root / domain / filename
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8", errors="replace")
+        return str(path)
+    except Exception:
+        return ""
 
 
 def detect_image_extension(url, content_type=""):
@@ -1082,6 +1183,7 @@ def fetch_html(url):
             f"Błąd HTTP podczas pobierania strony: {safe_str(exc)}",
             debug=response_debug,
         ) from exc
+    response_debug["cached_html_path"] = cache_scrape_html(response.url, response.text, stage="requests")
     return response.url, response.text
 
 
@@ -1119,6 +1221,47 @@ def find_chrome_binary():
     return ""
 
 
+def chrome_app_bundle_from_binary(chrome_path):
+    path = Path(safe_str(chrome_path))
+    parts = path.parts
+    for idx, part in enumerate(parts):
+        if part.endswith(".app"):
+            return str(Path(*parts[: idx + 1]))
+    return ""
+
+
+def build_macos_terminal_launcher_script(chrome_path, chrome_args, profile_dir):
+    script_path = Path(profile_dir) / "launch-olek-chrome.command"
+    command = " ".join([shlex.quote(safe_str(chrome_path))] + [shlex.quote(safe_str(arg)) for arg in chrome_args])
+    script_path.write_text(
+        "#!/bin/zsh\n"
+        "export PYTHONNOUSERSITE=1\n"
+        "echo 'Uruchamiam dedykowana sesje Chrome dla Olek...'\n"
+        f"exec {command}\n",
+        encoding="utf-8",
+    )
+    script_path.chmod(0o755)
+    return str(script_path)
+
+
+def build_olek_chrome_args(url, port=OLEK_BROWSER_DEBUG_PORT):
+    profile_dir = get_olek_browser_profile_dir()
+    return [
+        f"--remote-debugging-port={int(port)}",
+        f"--user-data-dir={profile_dir}",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--new-window",
+        safe_str(url),
+    ]
+
+
+def build_olek_manual_launch_command(url, port=OLEK_BROWSER_DEBUG_PORT):
+    chrome_path = find_chrome_binary() or "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+    chrome_args = build_olek_chrome_args(url, port=port)
+    return " ".join([shlex.quote(chrome_path)] + [shlex.quote(arg) for arg in chrome_args])
+
+
 def get_olek_browser_profile_dir():
     base_dir = Path.cwd() / ".browser-sessions"
     profile_dir = base_dir / "olek-chrome-profile"
@@ -1145,6 +1288,374 @@ def get_chrome_debug_endpoint(port=OLEK_BROWSER_DEBUG_PORT):
     return {}
 
 
+def get_chrome_debug_base_url(port=OLEK_BROWSER_DEBUG_PORT):
+    return f"http://127.0.0.1:{int(port)}"
+
+
+def get_chrome_debug_targets(port=OLEK_BROWSER_DEBUG_PORT):
+    try:
+        response = requests.get(f"{get_chrome_debug_base_url(port)}/json/list", timeout=2)
+        response.raise_for_status()
+        data = response.json()
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def create_chrome_debug_target(url, port=OLEK_BROWSER_DEBUG_PORT):
+    encoded_url = quote(safe_str(url), safe=":/,")
+    response = requests.put(f"{get_chrome_debug_base_url(port)}/json/new?{encoded_url}", timeout=4)
+    response.raise_for_status()
+    data = response.json()
+    if not isinstance(data, dict) or not data.get("webSocketDebuggerUrl"):
+        raise RuntimeError("Chrome DevTools nie zwrócił websocketu nowej karty.")
+    return data
+
+
+def activate_chrome_debug_target(target_id, port=OLEK_BROWSER_DEBUG_PORT):
+    if not target_id:
+        return
+    try:
+        requests.get(f"{get_chrome_debug_base_url(port)}/json/activate/{quote(safe_str(target_id), safe='')}", timeout=2)
+    except Exception:
+        pass
+
+
+def close_chrome_debug_target(target_id, port=OLEK_BROWSER_DEBUG_PORT):
+    if not target_id:
+        return
+    try:
+        requests.get(f"{get_chrome_debug_base_url(port)}/json/close/{quote(safe_str(target_id), safe='')}", timeout=2)
+    except Exception:
+        pass
+
+
+class ChromeDevToolsWebSocket:
+    def __init__(self, websocket_url, timeout=8):
+        self.websocket_url = safe_str(websocket_url)
+        self.timeout = timeout
+        self.sock = None
+        self.next_id = 1
+
+    def __enter__(self):
+        self.connect()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.close()
+
+    def connect(self):
+        parsed = urlparse(self.websocket_url)
+        if parsed.scheme not in {"ws", "wss"}:
+            raise RuntimeError(f"Nieobsługiwany websocket CDP: {self.websocket_url}")
+        port = parsed.port or (443 if parsed.scheme == "wss" else 80)
+        raw_sock = socket.create_connection((parsed.hostname, port), timeout=self.timeout)
+        if parsed.scheme == "wss":
+            raw_sock = ssl.create_default_context().wrap_socket(raw_sock, server_hostname=parsed.hostname)
+        raw_sock.settimeout(self.timeout)
+        path = parsed.path or "/"
+        if parsed.query:
+            path = f"{path}?{parsed.query}"
+        key = base64.b64encode(os.urandom(16)).decode("ascii")
+        request = (
+            f"GET {path} HTTP/1.1\r\n"
+            f"Host: {parsed.hostname}:{port}\r\n"
+            "Upgrade: websocket\r\n"
+            "Connection: Upgrade\r\n"
+            f"Sec-WebSocket-Key: {key}\r\n"
+            "Sec-WebSocket-Version: 13\r\n"
+            "\r\n"
+        )
+        raw_sock.sendall(request.encode("ascii"))
+        response = b""
+        while b"\r\n\r\n" not in response:
+            chunk = raw_sock.recv(4096)
+            if not chunk:
+                break
+            response += chunk
+            if len(response) > 65536:
+                break
+        status_line = response.split(b"\r\n", 1)[0].decode("ascii", "replace")
+        if " 101 " not in status_line:
+            raise RuntimeError(f"Chrome DevTools odrzucił websocket: {status_line}")
+        self.sock = raw_sock
+
+    def close(self):
+        if self.sock is None:
+            return
+        try:
+            self._send_frame(0x8, b"")
+        except Exception:
+            pass
+        try:
+            self.sock.close()
+        except Exception:
+            pass
+        self.sock = None
+
+    def _recv_exact(self, length):
+        data = b""
+        while len(data) < length:
+            chunk = self.sock.recv(length - len(data))
+            if not chunk:
+                raise RuntimeError("Połączenie CDP websocket zostało zamknięte.")
+            data += chunk
+        return data
+
+    def _send_frame(self, opcode, payload):
+        payload = payload or b""
+        header = bytearray([0x80 | int(opcode)])
+        length = len(payload)
+        if length < 126:
+            header.append(0x80 | length)
+        elif length < 65536:
+            header.append(0x80 | 126)
+            header.extend(struct.pack("!H", length))
+        else:
+            header.append(0x80 | 127)
+            header.extend(struct.pack("!Q", length))
+        mask = os.urandom(4)
+        header.extend(mask)
+        masked_payload = bytes(byte ^ mask[index % 4] for index, byte in enumerate(payload))
+        self.sock.sendall(header + masked_payload)
+
+    def _recv_frame(self):
+        first, second = self._recv_exact(2)
+        fin = bool(first & 0x80)
+        opcode = first & 0x0F
+        masked = bool(second & 0x80)
+        length = second & 0x7F
+        if length == 126:
+            length = struct.unpack("!H", self._recv_exact(2))[0]
+        elif length == 127:
+            length = struct.unpack("!Q", self._recv_exact(8))[0]
+        mask = self._recv_exact(4) if masked else b""
+        payload = self._recv_exact(length) if length else b""
+        if masked:
+            payload = bytes(byte ^ mask[index % 4] for index, byte in enumerate(payload))
+        return fin, opcode, payload
+
+    def recv_json(self, timeout=None):
+        if timeout is not None:
+            self.sock.settimeout(timeout)
+        fragments = []
+        while True:
+            fin, opcode, payload = self._recv_frame()
+            if opcode == 0x8:
+                raise RuntimeError("Chrome zamknął websocket CDP.")
+            if opcode == 0x9:
+                self._send_frame(0xA, payload)
+                continue
+            if opcode == 0xA:
+                continue
+            if opcode in {0x1, 0x0}:
+                fragments.append(payload)
+                if fin:
+                    return json.loads(b"".join(fragments).decode("utf-8", "replace"))
+
+    def request(self, method, params=None, timeout=8):
+        request_id = self.next_id
+        self.next_id += 1
+        payload = {"id": request_id, "method": method}
+        if params is not None:
+            payload["params"] = params
+        self._send_frame(0x1, json.dumps(payload, separators=(",", ":")).encode("utf-8"))
+        deadline = time.time() + max(1, float(timeout))
+        while time.time() < deadline:
+            remaining = max(0.1, deadline - time.time())
+            try:
+                message = self.recv_json(timeout=remaining)
+            except socket.timeout as exc:
+                raise RuntimeError(f"Timeout CDP dla komendy {method}.") from exc
+            if message.get("id") != request_id:
+                continue
+            if message.get("error"):
+                error = message.get("error") or {}
+                raise RuntimeError(safe_str(error.get("message") or error))
+            return message.get("result", {})
+        raise RuntimeError(f"Timeout CDP dla komendy {method}.")
+
+
+def cdp_evaluate_value(cdp, expression, timeout=8):
+    result = cdp.request(
+        "Runtime.evaluate",
+        {
+            "expression": expression,
+            "returnByValue": True,
+            "awaitPromise": True,
+        },
+        timeout=timeout,
+    )
+    if result.get("exceptionDetails"):
+        raise RuntimeError(make_response_preview(json.dumps(result.get("exceptionDetails"), ensure_ascii=False), limit=500))
+    remote_object = result.get("result") or {}
+    if "value" in remote_object:
+        return remote_object.get("value")
+    return remote_object.get("unserializableValue", "")
+
+
+def fetch_html_via_chrome_devtools(url, verify_timeout_seconds=OLEK_BROWSER_VERIFY_TIMEOUT_SECONDS, base_debug=None):
+    endpoint_data = get_chrome_debug_endpoint(OLEK_BROWSER_DEBUG_PORT)
+    browser_debug = dict(base_debug or {})
+    browser_debug.update({
+        "stage": "fetch_html_chrome_devtools",
+        "requested_url": safe_str(url),
+        "debug_port": int(OLEK_BROWSER_DEBUG_PORT),
+        "endpoint_url": endpoint_data.get("endpoint_url", ""),
+        "browser_version": endpoint_data.get("browser_version", ""),
+        "verification_timeout_seconds": int(verify_timeout_seconds),
+    })
+    if not endpoint_data:
+        raise ScrapeDiagnosticError("Sesja Chrome DevTools dla Olek nie działa.", debug=browser_debug)
+
+    target = create_chrome_debug_target(url, port=OLEK_BROWSER_DEBUG_PORT)
+    target_id = safe_str(target.get("id", ""))
+    browser_debug["target_id"] = target_id
+    browser_debug["target_url"] = safe_str(target.get("url", ""))
+    browser_debug["target_websocket_url"] = safe_str(target.get("webSocketDebuggerUrl", ""))
+    activate_chrome_debug_target(target_id, port=OLEK_BROWSER_DEBUG_PORT)
+    append_olek_trace(
+        "persistent_fetch_raw_cdp_target_created",
+        url=url,
+        target_id=target_id,
+        target_url=browser_debug.get("target_url", ""),
+    )
+
+    should_close_target = False
+    try:
+        with ChromeDevToolsWebSocket(browser_debug["target_websocket_url"]) as cdp:
+            for method in ["Page.enable", "Runtime.enable", "Network.enable"]:
+                try:
+                    cdp.request(method, timeout=4)
+                except Exception as exc:
+                    browser_debug[f"{method}_error"] = safe_str(exc)
+
+            deadline = time.time() + max(10, int(verify_timeout_seconds))
+            last_html = ""
+            last_url = safe_str(url)
+            browser_user_agent = ""
+            reloaded_after_clearance = False
+            navigated_to_requested_url = False
+            while time.time() < deadline:
+                try:
+                    current_url = safe_str(cdp_evaluate_value(cdp, "location.href", timeout=5) or "")
+                except Exception:
+                    current_url = ""
+                if should_navigate_to_requested_url(current_url, url) and not navigated_to_requested_url:
+                    append_olek_trace("persistent_fetch_raw_cdp_goto", url=url, current_url=current_url)
+                    cdp.request("Page.navigate", {"url": safe_str(url)}, timeout=8)
+                    navigated_to_requested_url = True
+                    time.sleep(1)
+                    continue
+
+                try:
+                    last_url = safe_str(cdp_evaluate_value(cdp, "location.href", timeout=5) or url)
+                except Exception:
+                    last_url = current_url or safe_str(url)
+                try:
+                    last_html = safe_str(cdp_evaluate_value(cdp, "document.documentElement ? document.documentElement.outerHTML : ''", timeout=8) or "")
+                except Exception as exc:
+                    browser_debug["raw_cdp_outer_html_error"] = safe_str(exc)
+                    last_html = ""
+                if not browser_user_agent:
+                    try:
+                        browser_user_agent = safe_str(cdp_evaluate_value(cdp, "navigator.userAgent", timeout=5) or "")
+                    except Exception:
+                        browser_user_agent = ""
+
+                cookies = []
+                try:
+                    cookies = cdp.request("Network.getCookies", {"urls": [safe_str(url)]}, timeout=5).get("cookies", [])
+                except Exception as exc:
+                    browser_debug["raw_cdp_cookies_error"] = safe_str(exc)
+                cookie_names = [safe_str(cookie.get("name", "")) for cookie in cookies if safe_str(cookie.get("name", ""))]
+                has_cf_clearance = "cf_clearance" in cookie_names
+                waf_vendor = detect_waf_vendor_from_html(last_html)
+                try:
+                    browser_debug["response_title"] = normalize_whitespace(cdp_evaluate_value(cdp, "document.title", timeout=5) or "")
+                except Exception:
+                    browser_debug["response_title"] = ""
+                browser_debug["final_url"] = last_url
+                browser_debug["response_preview"] = make_response_preview(last_html)
+                browser_debug["waf_detected"] = bool(waf_vendor)
+                browser_debug["waf_vendor"] = waf_vendor
+                browser_debug["cookie_names"] = cookie_names[:20]
+                browser_debug["has_cf_clearance"] = has_cf_clearance
+                browser_debug["browser_user_agent"] = browser_user_agent
+                append_olek_trace(
+                    "persistent_fetch_raw_cdp_poll",
+                    url=url,
+                    final_url=last_url,
+                    waf_vendor=waf_vendor,
+                    has_cf_clearance=has_cf_clearance,
+                    cookie_names=cookie_names[:20],
+                    response_title=browser_debug.get("response_title", ""),
+                )
+
+                if last_html.strip() and not waf_vendor:
+                    append_olek_trace("persistent_fetch_raw_cdp_success_dom", url=url, final_url=last_url)
+                    cache_scrape_html(last_url, last_html, stage="raw-cdp")
+                    should_close_target = True
+                    return last_url, last_html
+
+                if has_cf_clearance:
+                    try:
+                        requests_url, requests_html = fetch_html_with_browser_cookies(
+                            safe_str(url),
+                            cookies,
+                            user_agent=browser_user_agent,
+                        )
+                        requests_waf_vendor = detect_waf_vendor_from_html(requests_html)
+                        browser_debug["requests_with_cookies_final_url"] = requests_url
+                        browser_debug["requests_with_cookies_preview"] = make_response_preview(requests_html)
+                        browser_debug["requests_with_cookies_waf_vendor"] = requests_waf_vendor
+                        append_olek_trace(
+                            "persistent_fetch_raw_cdp_requests_with_cookies",
+                            url=url,
+                            final_url=requests_url,
+                            waf_vendor=requests_waf_vendor,
+                        )
+                        if requests_html.strip() and not requests_waf_vendor:
+                            append_olek_trace("persistent_fetch_raw_cdp_success_requests_with_cookies", url=url, final_url=requests_url)
+                            cache_scrape_html(requests_url, requests_html, stage="raw-cdp-cookies")
+                            should_close_target = True
+                            return requests_url, requests_html
+                    except Exception as exc:
+                        browser_debug["requests_with_cookies_error"] = safe_str(exc)
+                        append_olek_trace("persistent_fetch_raw_cdp_requests_with_cookies_error", url=url, error=safe_str(exc))
+
+                if waf_vendor == "cloudflare" and has_cf_clearance and not reloaded_after_clearance:
+                    try:
+                        append_olek_trace("persistent_fetch_raw_cdp_reload_after_clearance", url=url, current_page_url=last_url)
+                        cdp.request("Page.navigate", {"url": safe_str(url)}, timeout=8)
+                        reloaded_after_clearance = True
+                        time.sleep(1)
+                        continue
+                    except Exception as exc:
+                        browser_debug["reload_after_clearance_error"] = safe_str(exc)
+                        append_olek_trace("persistent_fetch_raw_cdp_reload_after_clearance_error", url=url, error=safe_str(exc))
+
+                time.sleep(OLEK_BROWSER_POLL_INTERVAL_SECONDS)
+
+        raise ScrapeDiagnosticError(
+            "Cloudflare nadal blokuje dostęp. Otwarta została karta Chrome dla Olek. "
+            "Zakończ challenge w tej samej przeglądarce i ponów próbę.",
+            debug=browser_debug,
+        )
+    except ScrapeDiagnosticError:
+        raise
+    except Exception as exc:
+        browser_debug["raw_cdp_error"] = safe_str(exc)
+        append_olek_trace("persistent_fetch_raw_cdp_error", url=url, error=safe_str(exc))
+        raise ScrapeDiagnosticError(
+            f"Awaryjne połączenie Chrome DevTools nie zadziałało: {safe_str(exc)}",
+            debug=browser_debug,
+        ) from exc
+    finally:
+        if should_close_target:
+            close_chrome_debug_target(target_id, port=OLEK_BROWSER_DEBUG_PORT)
+
+
 def fetch_html_with_browser_cookies(url, cookies, user_agent=""):
     session = requests.Session()
     session.headers.update(HEADERS)
@@ -1161,6 +1672,7 @@ def fetch_html_with_browser_cookies(url, cookies, user_agent=""):
         session.cookies.set(name, value, domain=domain, path=path)
     response = session.get(safe_str(url), timeout=TIMEOUT)
     response.raise_for_status()
+    cache_scrape_html(response.url, response.text, stage="browser-cookies")
     return safe_str(response.url), safe_str(response.text)
 
 
@@ -1197,21 +1709,102 @@ def launch_olek_browser_session(url, port=OLEK_BROWSER_DEBUG_PORT):
         }
 
     profile_dir = get_olek_browser_profile_dir()
-    cmd = [
-        chrome_path,
-        f"--remote-debugging-port={int(port)}",
-        f"--user-data-dir={profile_dir}",
-        "--no-first-run",
-        "--no-default-browser-check",
-        "--new-window",
-        safe_str(url),
-    ]
+    chrome_args = build_olek_chrome_args(url, port=port)
+    open_attempts = []
+    if sys.platform == "darwin":
+        app_bundle = chrome_app_bundle_from_binary(chrome_path)
+        app_name = "Google Chrome" if "Google Chrome.app" in chrome_path else "Chromium"
+        terminal_script = build_macos_terminal_launcher_script(chrome_path, chrome_args, profile_dir)
+        open_attempts.append(("macos_launchctl_asuser", ["launchctl", "asuser", str(os.getuid()), chrome_path] + chrome_args, "popen"))
+        if Path("/System/Applications/Utilities/Terminal.app").exists():
+            open_attempts.append(("macos_terminal_app_path", ["open", "-a", "/System/Applications/Utilities/Terminal.app", terminal_script], "run"))
+        open_attempts.append(("macos_terminal_bundle_id", ["open", "-b", "com.apple.Terminal", terminal_script], "run"))
+        open_attempts.append(("macos_terminal_command_script", ["open", "-a", "Terminal", terminal_script], "run"))
+        if app_bundle:
+            open_attempts.append(("macos_open_app_bundle_a", ["open", "-n", "-a", app_bundle, "--args"] + chrome_args, "run"))
+        open_attempts.append(("macos_open_bundle_id", ["open", "-n", "-b", "com.google.Chrome", "--args"] + chrome_args, "run"))
+        open_attempts.append(("macos_open_app_name", ["open", "-n", "-a", app_name, "--args"] + chrome_args, "run"))
+        if app_bundle:
+            open_attempts.append(("macos_open_app_bundle_file", ["open", "-n", app_bundle, "--args"] + chrome_args, "run"))
+        launch_method = "macos_launchctl_asuser"
+    else:
+        open_attempts.append(("direct_popen", [chrome_path] + chrome_args, "popen"))
+        launch_method = "direct_popen"
+
+    endpoint_data = {}
+    last_error = ""
     try:
-        subprocess.Popen(
-            cmd,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
+        for attempt_name, cmd, attempt_mode in open_attempts:
+            append_olek_trace(
+                "launch_session_command",
+                url=url,
+                port=port,
+                launch_method=attempt_name,
+                launch_mode=attempt_mode,
+                browser_path=chrome_path,
+                app_bundle=chrome_app_bundle_from_binary(chrome_path),
+                profile_dir=str(profile_dir),
+            )
+            launched_process = None
+            if attempt_mode == "run":
+                open_result = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=12,
+                    check=False,
+                )
+                append_olek_trace(
+                    "launch_session_open_result",
+                    url=url,
+                    port=port,
+                    launch_method=attempt_name,
+                    return_code=open_result.returncode,
+                    stdout_preview=make_response_preview(open_result.stdout, limit=500),
+                    stderr_preview=make_response_preview(open_result.stderr, limit=500),
+                )
+                if open_result.returncode != 0:
+                    last_error = make_response_preview(open_result.stderr or open_result.stdout or "open failed", limit=500)
+                    continue
+            else:
+                launched_process = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    start_new_session=True,
+                )
+                append_olek_trace(
+                    "launch_session_popen_started",
+                    url=url,
+                    port=port,
+                    launch_method=attempt_name,
+                    pid=launched_process.pid,
+                )
+
+            deadline = time.time() + 18
+            while time.time() < deadline:
+                endpoint_data = get_chrome_debug_endpoint(port)
+                if endpoint_data:
+                    launch_method = attempt_name
+                    break
+                if launched_process is not None and launched_process.poll() is not None:
+                    last_error = f"Chrome zakończył działanie przed udostępnieniem debug endpointu (kod: {launched_process.returncode})."
+                    break
+                time.sleep(0.5)
+            if endpoint_data:
+                break
+            append_olek_trace(
+                "launch_session_no_debug_endpoint_after_attempt",
+                url=url,
+                port=port,
+                launch_method=attempt_name,
+                profile_dir=str(profile_dir),
+            )
+
+        if not endpoint_data:
+            if not last_error:
+                last_error = "Chrome uruchomił się bez dostępnego debug endpointu."
+            raise RuntimeError(last_error)
     except Exception as exc:
         append_olek_trace("launch_session_popen_error", url=url, port=port, error=safe_str(exc))
         raise ScrapeDiagnosticError(
@@ -1223,20 +1816,14 @@ def launch_olek_browser_session(url, port=OLEK_BROWSER_DEBUG_PORT):
                 "browser_path_found": True,
                 "profile_dir": str(profile_dir),
                 "debug_port": int(port),
+                "launch_method": launch_method,
             },
         ) from exc
-
-    deadline = time.time() + 15
-    endpoint_data = {}
-    while time.time() < deadline:
-        endpoint_data = get_chrome_debug_endpoint(port)
-        if endpoint_data:
-            break
-        time.sleep(0.5)
     append_olek_trace(
         "launch_session_ready",
         url=url,
         port=port,
+        launch_method=launch_method,
         endpoint_url=endpoint_data.get("endpoint_url", ""),
         browser_version=endpoint_data.get("browser_version", ""),
         profile_dir=str(profile_dir),
@@ -1247,6 +1834,7 @@ def launch_olek_browser_session(url, port=OLEK_BROWSER_DEBUG_PORT):
         "browser_path": chrome_path,
         "profile_dir": str(profile_dir),
         "debug_port": int(port),
+        "launch_method": launch_method,
         "endpoint_url": endpoint_data.get("endpoint_url", ""),
         "browser_version": endpoint_data.get("browser_version", ""),
     }
@@ -1268,6 +1856,8 @@ def fetch_html_via_persistent_browser_session(url, verify_timeout_seconds=OLEK_B
                 "browser_path_found": bool(chrome_path),
                 "playwright_available": False,
                 "playwright_import_error": safe_str(exc),
+                "python_executable": sys.executable,
+                "local_venv_site_packages_added": [path for path in sys.path if "/.venv/lib/" in path],
             },
         ) from exc
 
@@ -1306,10 +1896,21 @@ def fetch_html_via_persistent_browser_session(url, verify_timeout_seconds=OLEK_B
         except Exception as exc:
             append_olek_trace("persistent_fetch_connect_over_cdp_error", url=url, error=safe_str(exc))
             browser_debug["connect_over_cdp_error"] = safe_str(exc)
-            raise ScrapeDiagnosticError(
-                f"Nie udało się podłączyć do lokalnej sesji Chrome dla Olek: {safe_str(exc)}",
-                debug=browser_debug,
-            ) from exc
+            append_olek_trace("persistent_fetch_raw_cdp_fallback_start", url=url)
+            try:
+                return fetch_html_via_chrome_devtools(
+                    url,
+                    verify_timeout_seconds=verify_timeout_seconds,
+                    base_debug=browser_debug,
+                )
+            except ScrapeDiagnosticError as raw_exc:
+                raw_debug = getattr(raw_exc, "debug", {}) if raw_exc is not None else {}
+                browser_debug["raw_cdp_fallback_error"] = safe_str(raw_exc)
+                browser_debug["raw_cdp_fallback_debug"] = raw_debug
+                raise ScrapeDiagnosticError(
+                    f"Nie udało się podłączyć do lokalnej sesji Chrome dla Olek przez Playwright ani awaryjny CDP: {safe_str(exc)}",
+                    debug=browser_debug,
+                ) from raw_exc
 
         try:
             contexts = browser.contexts
@@ -1320,28 +1921,37 @@ def fetch_html_via_persistent_browser_session(url, verify_timeout_seconds=OLEK_B
             browser_debug["existing_pages"] = [safe_str(existing_page.url) for existing_page in context.pages[:10]]
             target_host = urlparse(safe_str(url)).netloc.lower()
             page = None
+            exact_pages = []
             matching_pages = []
             for existing_page in context.pages:
                 page_url = safe_str(existing_page.url)
                 page_host = urlparse(page_url).netloc.lower()
-                if page_host == target_host:
+                if not should_navigate_to_requested_url(page_url, url):
+                    exact_pages.append(existing_page)
+                elif page_host == target_host:
                     matching_pages.append(existing_page)
-            if matching_pages:
+            if exact_pages:
+                page = exact_pages[-1]
+                browser_debug["reused_existing_page"] = True
+                browser_debug["reused_exact_page"] = True
+            elif matching_pages:
                 page = matching_pages[-1]
                 browser_debug["reused_existing_page"] = True
+                browser_debug["reused_exact_page"] = False
             else:
                 page = context.new_page()
                 browser_debug["reused_existing_page"] = False
+                browser_debug["reused_exact_page"] = False
             append_olek_trace(
                 "persistent_fetch_page_selected",
                 url=url,
                 existing_pages=browser_debug.get("existing_pages", []),
                 reused_existing_page=browser_debug.get("reused_existing_page"),
+                reused_exact_page=browser_debug.get("reused_exact_page"),
             )
             page.bring_to_front()
             current_url = safe_str(page.url or "")
-            current_host = urlparse(current_url).netloc.lower()
-            should_navigate = current_host != target_host or not current_url
+            should_navigate = should_navigate_to_requested_url(current_url, url)
             browser_debug["selected_page_url"] = current_url
             browser_debug["should_navigate_initially"] = should_navigate
             if should_navigate:
@@ -1396,6 +2006,7 @@ def fetch_html_via_persistent_browser_session(url, verify_timeout_seconds=OLEK_B
                 )
                 if last_html.strip() and not waf_vendor:
                     append_olek_trace("persistent_fetch_success_dom", url=url, final_url=last_url)
+                    cache_scrape_html(last_url, last_html, stage="persistent-browser")
                     try:
                         page.close()
                     except Exception:
@@ -1420,6 +2031,7 @@ def fetch_html_via_persistent_browser_session(url, verify_timeout_seconds=OLEK_B
                         )
                         if requests_html.strip() and not requests_waf_vendor:
                             append_olek_trace("persistent_fetch_success_requests_with_cookies", url=url, final_url=requests_url)
+                            cache_scrape_html(requests_url, requests_html, stage="persistent-cookies")
                             try:
                                 page.close()
                             except Exception:
@@ -1473,6 +2085,17 @@ def fetch_html_with_playwright(url, wait_timeout_ms=25000):
                 "browser_path_found": False,
             },
         )
+    if sys.platform == "darwin":
+        raise ScrapeDiagnosticError(
+            "Playwright launch fallback jest wyłączony na macOS, bo uruchamianie binarki Chrome bezpośrednio powodowało crash Google Chrome. Użyj persistent sesji Olek albo uruchom Chrome z remote debugging ręcznie.",
+            debug={
+                "stage": "fetch_html_playwright",
+                "requested_url": safe_str(url),
+                "browser_path": chrome_path,
+                "browser_path_found": True,
+                "disabled_on_macos": True,
+            },
+        )
 
     try:
         from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
@@ -1492,13 +2115,15 @@ def fetch_html_with_playwright(url, wait_timeout_ms=25000):
 
     with tempfile.TemporaryDirectory(prefix="generator-chatshoper-olek-pw-") as tmp_dir:
         user_data_dir = str(Path(tmp_dir) / "playwright-profile")
+        headless_mode = sys.platform == "darwin"
         browser_debug = {
             "stage": "fetch_html_playwright",
             "requested_url": safe_str(url),
             "browser_path": chrome_path,
             "browser_path_found": True,
             "playwright_available": True,
-            "playwright_headless": False,
+            "playwright_headless": headless_mode,
+            "playwright_headed_disabled_reason": "macos_appkit_crash_guard" if headless_mode else "",
             "playwright_wait_timeout_ms": int(wait_timeout_ms),
         }
         try:
@@ -1506,7 +2131,7 @@ def fetch_html_with_playwright(url, wait_timeout_ms=25000):
                 context = p.chromium.launch_persistent_context(
                     user_data_dir=user_data_dir,
                     executable_path=chrome_path,
-                    headless=False,
+                    headless=headless_mode,
                     args=[
                         "--disable-blink-features=AutomationControlled",
                         "--disable-dev-shm-usage",
@@ -1572,6 +2197,7 @@ def fetch_html_with_playwright(url, wait_timeout_ms=25000):
             f"Playwright fallback nadal widzi blokadę {browser_debug.get('waf_vendor')}.",
             debug=browser_debug,
         )
+    browser_debug["cached_html_path"] = cache_scrape_html(final_url, html_text, stage="playwright")
     return final_url, html_text
 
 
@@ -1584,6 +2210,19 @@ def fetch_html_with_local_chrome(url, virtual_time_budget_ms=12000):
                 "stage": "fetch_html_browser",
                 "requested_url": safe_str(url),
                 "browser_path_found": False,
+            },
+        )
+    if sys.platform == "darwin":
+        raise ScrapeDiagnosticError(
+            "Bezpośredni headless Chrome fallback jest wyłączony na macOS, bo ta ścieżka powodowała crash Google Chrome. Użyj sesji Olek przez przeglądarkę.",
+            debug={
+                "stage": "fetch_html_browser",
+                "requested_url": safe_str(url),
+                "browser_path": chrome_path,
+                "browser_path_found": True,
+                "disabled_on_macos": True,
+                "waf_detected": False,
+                "waf_vendor": "",
             },
         )
 
@@ -1655,6 +2294,7 @@ def fetch_html_with_local_chrome(url, virtual_time_budget_ms=12000):
                 "waf_vendor": waf_vendor,
             })
             if result.returncode == 0 and html_text.strip() and not waf_vendor:
+                cache_scrape_html(url, html_text, stage="local-chrome")
                 return safe_str(url), html_text
             if result.returncode == 0 and html_text.strip() and waf_vendor:
                 raise ScrapeDiagnosticError(
@@ -1688,12 +2328,12 @@ def fetch_html_with_local_chrome(url, virtual_time_budget_ms=12000):
     )
 
 
-def fetch_olek_html(url):
-    final_url, html_text, _ = fetch_olek_html_details(url)
+def fetch_olek_html(url, verify_timeout_seconds=OLEK_BROWSER_VERIFY_TIMEOUT_SECONDS):
+    final_url, html_text, _ = fetch_olek_html_details(url, verify_timeout_seconds=verify_timeout_seconds)
     return final_url, html_text
 
 
-def fetch_olek_html_details(url):
+def fetch_olek_html_details(url, verify_timeout_seconds=OLEK_BROWSER_VERIFY_TIMEOUT_SECONDS):
     try:
         final_url, html_text = fetch_html(url)
         return final_url, html_text, "requests"
@@ -1704,10 +2344,13 @@ def fetch_olek_html_details(url):
         if waf_vendor == "cloudflare" or status_code == "403":
             persistent_error = None
             try:
-                final_url, html_text = fetch_html_via_persistent_browser_session(url)
+                final_url, html_text = fetch_html_via_persistent_browser_session(url, verify_timeout_seconds=verify_timeout_seconds)
                 return final_url, html_text, "browser_session_reuse"
             except ScrapeDiagnosticError as persistent_exc:
                 persistent_error = persistent_exc
+                persistent_debug = getattr(persistent_exc, "debug", {}) if persistent_exc is not None else {}
+                if persistent_debug.get("manual_command"):
+                    raise persistent_exc
             chrome_error = None
             try:
                 final_url, html_text = fetch_html_with_local_chrome(url)
@@ -1843,8 +2486,8 @@ def extract_olek_title_from_anchor(anchor):
     return ""
 
 
-def scrape_olek_listing(url):
-    final_url, html_doc, fetch_method = fetch_olek_html_details(url)
+def scrape_olek_listing(url, verify_timeout_seconds=OLEK_BROWSER_VERIFY_TIMEOUT_SECONDS):
+    final_url, html_doc, fetch_method = fetch_olek_html_details(url, verify_timeout_seconds=verify_timeout_seconds)
     soup = BeautifulSoup(html_doc, "html.parser")
     preview = []
     seen = set()
@@ -1906,8 +2549,8 @@ def scrape_olek_listing(url):
     )
 
 
-def scrape_olek_product(url):
-    final_url, html_doc, fetch_method = fetch_olek_html_details(url)
+def scrape_olek_product(url, verify_timeout_seconds=OLEK_BROWSER_VERIFY_TIMEOUT_SECONDS):
+    final_url, html_doc, fetch_method = fetch_olek_html_details(url, verify_timeout_seconds=verify_timeout_seconds)
     soup = BeautifulSoup(html_doc, "html.parser")
     page_text = extract_product_main_text(soup)
     json_ld_items = extract_json_ld(soup)
@@ -2804,11 +3447,11 @@ def extract_product_main_text(soup):
 
 
 @st.cache_data(show_spinner=False, ttl=3600)
-def scrape_product_url(url):
+def scrape_product_url(url, olek_verify_timeout_seconds=OLEK_BROWSER_VERIFY_TIMEOUT_SECONDS):
     if is_sansa_url(url):
         return scrape_sansa_product(url)
     if is_olek_url(url):
-        return scrape_olek_product(url)
+        return scrape_olek_product(url, verify_timeout_seconds=olek_verify_timeout_seconds)
 
     final_url, html = fetch_html(url)
     soup = BeautifulSoup(html, "html.parser")
@@ -2923,11 +3566,11 @@ def is_probable_product_url(href, base_url):
 
 
 @st.cache_data(show_spinner=False, ttl=3600)
-def scrape_listing_products(url):
+def scrape_listing_products(url, olek_verify_timeout_seconds=OLEK_BROWSER_VERIFY_TIMEOUT_SECONDS):
     if is_sansa_url(url):
         return scrape_sansa_listing(url)
     if is_olek_url(url):
-        return scrape_olek_listing(url)
+        return scrape_olek_listing(url, verify_timeout_seconds=olek_verify_timeout_seconds)
 
     final_url, html = fetch_html(url)
     soup = BeautifulSoup(html, "html.parser")
@@ -3228,13 +3871,22 @@ def generate_with_claude(client, model, rewrite_mode, product_data, uploaded_ima
     }
     content = [{"type": "text", "text": json.dumps(prompt, ensure_ascii=False)}]
     content.extend(image_to_claude_content(uploaded_image))
-    message = client.messages.create(
-        model=model,
-        max_tokens=2200,
-        temperature=0.4,
-        system=REWRITE_SYSTEM_PROMPT if rewrite_mode else CREATE_SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": content}],
-    )
+    try:
+        message = client.messages.create(
+            model=model,
+            max_tokens=2200,
+            temperature=0.4,
+            system=REWRITE_SYSTEM_PROMPT if rewrite_mode else CREATE_SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": content}],
+        )
+    except Exception as exc:
+        error_text = safe_str(exc)
+        if "model" in error_text.lower() and any(token in error_text.lower() for token in ["not found", "invalid", "unknown", "does not exist"]):
+            raise RuntimeError(
+                f"Wybrany model Claude jest niedostępny: {model}. "
+                f"Zmień model w sidebarze albo ustaw aktualną listę w {MODEL_OPTIONS_ENV}."
+            ) from exc
+        raise
     text = "".join(block.text for block in message.content if getattr(block, "type", "") == "text")
     data, model_debug = safe_parse_model_json(text, client=client, model=model)
     model_debug["generation_mode"] = "rewrite_api" if rewrite_mode else "ai"
@@ -4265,6 +4917,9 @@ def init_state():
         "claude_client": None,
         "bulk_products": [],
         "bulk_selected": {},
+        "bulk_status": {},
+        "csv_encoding": "UTF-8 BOM",
+        "olek_verify_timeout_seconds": OLEK_BROWSER_VERIFY_TIMEOUT_SECONDS,
         "buying_discount_links": 20.0,
         "buying_discount_bulk": 20.0,
         "buying_discount_manual": 20.0,
@@ -4282,8 +4937,10 @@ def init_state():
             st.session_state.api_key = st.secrets.get("ANTHROPIC_API_KEY", "")
         except Exception:
             st.session_state.api_key = ""
-    if st.session_state.api_key and anthropic is not None and st.session_state.claude_client is None:
-        st.session_state.claude_client = anthropic.Anthropic(api_key=st.session_state.api_key)
+    if st.session_state.api_key and st.session_state.claude_client is None:
+        anthropic_module = get_anthropic_module()
+        if anthropic_module is not None:
+            st.session_state.claude_client = anthropic_module.Anthropic(api_key=st.session_state.api_key)
 
 
 def render_css():
@@ -4308,11 +4965,16 @@ def render_sidebar():
         api_key_input = st.text_input("API Key", type="password", value=st.session_state.api_key)
         if api_key_input != st.session_state.api_key:
             st.session_state.api_key = api_key_input.strip()
-            if anthropic is not None and st.session_state.api_key:
-                st.session_state.claude_client = anthropic.Anthropic(api_key=st.session_state.api_key)
+            anthropic_module = get_anthropic_module() if st.session_state.api_key else None
+            if anthropic_module is not None and st.session_state.api_key:
+                st.session_state.claude_client = anthropic_module.Anthropic(api_key=st.session_state.api_key)
             else:
                 st.session_state.claude_client = None
-        model = st.selectbox("Model Claude", MODEL_OPTIONS, index=0)
+                if st.session_state.api_key and anthropic_import_error:
+                    st.warning(f"Nie udało się załadować biblioteki Anthropic: {anthropic_import_error}")
+        model_options = get_model_options()
+        model = st.selectbox("Model Claude", model_options, index=0)
+        st.caption(f"Modele można nadpisać zmienną {MODEL_OPTIONS_ENV} (lista po przecinku).")
         rewrite_mode = st.checkbox("Tryb rewrite", value=False)
         rewrite_copy_without_api = st.checkbox(
             "Rewrite 1:1 bez API",
@@ -4321,15 +4983,39 @@ def render_sidebar():
         )
         with st.expander("Sesja Cloudflare", expanded=False):
             st.caption("Dla sklepów blokowanych przez Cloudflare, np. Olek Motocykle, otwiera dedykowaną sesję Chrome z trwałym profilem.")
-            if st.button("Otwórz sesję Olek", use_container_width=True):
-                try:
-                    launch_info = launch_olek_browser_session("https://shop.olekmotocykle.com/produkty,2")
-                    if launch_info.get("launched"):
-                        st.info("Otworzono dedykowaną sesję Chrome dla Olek. Przejdź challenge Cloudflare w tym oknie.")
-                    else:
-                        st.info("Sesja Olek jest już uruchomiona. Przejdź challenge Cloudflare w tym samym oknie Chrome.")
-                except Exception as exc:
-                    st.error(f"Nie udało się otworzyć sesji Olek: {safe_str(exc)}")
+            olek_default_url = "https://shop.olekmotocykle.com/produkty,2"
+            st.number_input(
+                "Timeout weryfikacji Olek (sek.)",
+                min_value=15,
+                max_value=300,
+                step=5,
+                key="olek_verify_timeout_seconds",
+                help="Ile sekund aplikacja czeka, aż przejdziesz Cloudflare w dedykowanym oknie Chrome.",
+            )
+            st.caption("Aplikacja próbuje otworzyć tę sesję automatycznie. Komenda poniżej zostaje tylko jako awaryjna diagnostyka:")
+            st.code(
+                build_olek_manual_launch_command(
+                    olek_default_url,
+                    port=OLEK_BROWSER_DEBUG_PORT,
+                ),
+                language="bash",
+            )
+            endpoint = get_chrome_debug_endpoint(OLEK_BROWSER_DEBUG_PORT)
+            if endpoint:
+                st.success(f"Sesja Olek działa: {endpoint.get('browser_version', '')}")
+            if st.button("Sprawdź / otwórz sesję Olek", use_container_width=True):
+                endpoint = get_chrome_debug_endpoint(OLEK_BROWSER_DEBUG_PORT)
+                if endpoint:
+                    st.info("Sesja Olek jest już uruchomiona. Przejdź Cloudflare w tym oknie Chrome, potem użyj listingu.")
+                else:
+                    try:
+                        launch_info = launch_olek_browser_session(olek_default_url)
+                        if launch_info.get("launched"):
+                            st.info("Otworzono dedykowaną sesję Chrome dla Olek. Przejdź challenge Cloudflare w tym oknie.")
+                        else:
+                            st.info("Sesja Olek jest już uruchomiona. Przejdź challenge Cloudflare w tym samym oknie Chrome.")
+                    except Exception as exc:
+                        st.error(f"Nie udało się otworzyć sesji Olek: {safe_str(exc)}")
         st.checkbox("Debug mode", key="debug_mode")
         if st.button("Wyczyść wyniki", use_container_width=True):
             st.session_state.results = []
@@ -4342,6 +5028,31 @@ def require_client():
         st.error("Wprowadź poprawny API Key Anthropic w sidebarze.")
         return None
     return st.session_state.claude_client
+
+
+def normalize_product_code_value(value, max_length=64):
+    text = ascii_fold(value).upper()
+    text = re.sub(r"[^A-Z0-9._-]+", "-", text).strip("-._")
+    return text[:max_length].strip("-._")
+
+
+def stable_product_code(scraped_data, name):
+    sku = normalize_product_code_value(scraped_data.get("sku", ""))
+    if sku:
+        return sku, "sku"
+
+    source_domain = normalize_product_code_value(scraped_data.get("source_domain", ""), max_length=18)
+    name_prefix = normalize_product_code_value(name, max_length=12) or "PRODUKT"
+    identity = "|".join([
+        safe_str(scraped_data.get("url", "")),
+        safe_str(scraped_data.get("source_domain", "")),
+        safe_str(name),
+        safe_str(scraped_data.get("price", "")),
+    ])
+    code_hash = short_hash(identity, 8).upper()
+    if source_domain:
+        return normalize_product_code_value(f"{source_domain}-{name_prefix}-{code_hash}"), "stable_hash_domain"
+    return normalize_product_code_value(f"{name_prefix}-{code_hash}"), "stable_hash"
 
 
 def next_product_code(name):
@@ -4357,7 +5068,7 @@ def resolve_product_code(scraped_data, name, use_full_name_as_product_code=False
     source_domain = safe_str(scraped_data.get("source_domain", "")).lower()
     sku = normalize_whitespace(scraped_data.get("sku", ""))
     sku_found = bool(sku)
-    if is_sansa_url(source_domain) and sku_found:
+    if sku_found:
         return sku, {
             "product_code_mode": "sku",
             "source_product_code": "sku",
@@ -4374,10 +5085,10 @@ def resolve_product_code(scraped_data, name, use_full_name_as_product_code=False
             "final_product_code": full_name_code,
         }
 
-    fallback_code = next_product_code(name)
+    fallback_code, fallback_source = stable_product_code(scraped_data, name)
     return fallback_code, {
-        "product_code_mode": "generated",
-        "source_product_code": "fallback_counter",
+        "product_code_mode": "stable_generated",
+        "source_product_code": fallback_source,
         "sku_found": sku_found,
         "final_product_code": fallback_code,
     }
@@ -4736,6 +5447,7 @@ def build_common_result(scraped, generated, manual_category, producer, discount,
     spec_fields = normalize_spec_fields(scraped_data.get("spec_fields", {}))
     variant_options = normalize_variant_options(scraped_data.get("variant_options", []))
     name = generated_data.get("name") or scraped_data.get("title") or "Produkt"
+    resolved_producer = normalize_whitespace(producer or scraped_data.get("brand", ""))
     description_with_specs = attach_specification_block(generated_data.get("description", ""), spec_fields)
     description_with_specs = attach_variant_options_block(description_with_specs, variant_options)
     product_code, product_code_debug = resolve_product_code(
@@ -4768,7 +5480,7 @@ def build_common_result(scraped, generated, manual_category, producer, discount,
         "name": safe_str(name),
         "product_code": product_code,
         "category": resolved_category,
-        "producer": safe_str(producer or ""),
+        "producer": safe_str(resolved_producer),
         "weight": parse_float(scraped_data.get("weight")),
         "price": price,
         "available": scraped_data.get("available"),
@@ -4801,7 +5513,7 @@ def build_common_result(scraped, generated, manual_category, producer, discount,
         "vinted_description_mode": infer_vinted_description_mode(generated_data),
         "vinted_category_group": "",
         "vinted_category_type": "",
-        "vinted_brand": safe_str(producer or scraped_data.get("brand", "")),
+        "vinted_brand": safe_str(resolved_producer or scraped_data.get("brand", "")),
         "vinted_size": infer_vinted_size(variant_options),
         "vinted_condition": "",
         "vinted_color": "",
@@ -4884,6 +5596,70 @@ VINTED_REQUIRED_FIELDS = [
 ]
 
 
+def validate_shoper_item(item, index=0):
+    normalized = normalize_result_item(item)
+    errors = []
+    warnings = []
+    label = f"wiersz {index + 1}"
+    if not normalize_whitespace(normalized.get("product_code", "")):
+        errors.append(f"{label}: brak product_code")
+    if not normalize_whitespace(normalized.get("name", "")):
+        errors.append(f"{label}: brak nazwy")
+    if not normalize_whitespace(normalized.get("category", "")):
+        warnings.append(f"{label}: brak kategorii")
+    if parse_float(normalized.get("price")) is None:
+        warnings.append(f"{label}: brak ceny")
+    if not normalized.get("images"):
+        warnings.append(f"{label}: brak zdjęć")
+    if not normalize_whitespace(normalized.get("description", "")):
+        warnings.append(f"{label}: brak opisu HTML")
+    seo_title = normalize_whitespace(normalized.get("seo_title", ""))
+    seo_description = normalize_whitespace(normalized.get("seo_description", ""))
+    if seo_title and len(seo_title) > 70:
+        warnings.append(f"{label}: SEO title ma {len(seo_title)} znaków")
+    if seo_description and len(seo_description) > 180:
+        warnings.append(f"{label}: SEO description ma {len(seo_description)} znaków")
+    if normalized.get("seo_url") and normalized.get("seo_url") != slugify(normalized.get("seo_url")):
+        warnings.append(f"{label}: SEO URL zawiera znaki wymagające normalizacji")
+    return errors, warnings
+
+
+def validate_shoper_results(results):
+    errors = []
+    warnings = []
+    seen_codes = {}
+    for index, item in enumerate(dedupe_results(results)):
+        item_errors, item_warnings = validate_shoper_item(item, index)
+        errors.extend(item_errors)
+        warnings.extend(item_warnings)
+        code = normalize_whitespace(item.get("product_code", ""))
+        if code:
+            if code in seen_codes:
+                errors.append(f"wiersz {index + 1}: duplikat product_code z wierszem {seen_codes[code] + 1}: {code}")
+            seen_codes[code] = index
+    return errors, warnings
+
+
+def export_shoper_validation_csv_bytes(results):
+    rows = []
+    for index, item in enumerate(dedupe_results(results)):
+        errors, warnings = validate_shoper_item(item, index)
+        if errors or warnings:
+            rows.append({
+                "row": index + 1,
+                "product_code": normalize_whitespace(item.get("product_code", "")),
+                "name": normalize_whitespace(item.get("name", "")),
+                "level": "error" if errors else "warning",
+                "messages": " | ".join(errors + warnings),
+            })
+    buffer = io.StringIO()
+    writer = csv.DictWriter(buffer, fieldnames=["row", "product_code", "name", "level", "messages"], delimiter=";", quoting=csv.QUOTE_ALL)
+    writer.writeheader()
+    for row in rows:
+        writer.writerow(row)
+    return buffer.getvalue().encode("utf-8-sig")
+
+
 def to_shoper_rows(results):
     rows = []
     for raw_item in results:
@@ -4922,7 +5698,7 @@ def to_shoper_rows(results):
     return rows
 
 
-def export_csv_bytes(results):
+def export_csv_bytes(results, encoding="utf-8"):
     deduped = dedupe_results(results)
     if len(EXPORT_HEADERS) != 51:
         raise RuntimeError(f"Nieprawidlowa liczba kolumn CSV: {len(EXPORT_HEADERS)} (oczekiwano 51)")
@@ -4931,7 +5707,8 @@ def export_csv_bytes(results):
     writer.writeheader()
     for row in to_shoper_rows(deduped):
         writer.writerow(row)
-    return buffer.getvalue().encode("utf-8")
+    selected_encoding = "utf-8-sig" if safe_str(encoding).lower() in {"utf-8 bom", "utf-8-sig", "bom"} else "utf-8"
+    return buffer.getvalue().encode(selected_encoding)
 
 
 def to_relative_export_path(path):
@@ -5034,6 +5811,65 @@ def export_vinted_bulk_csv_bytes(results):
     return buffer.getvalue().encode("utf-8"), rows
 
 
+def build_project_snapshot():
+    return {
+        "schema_version": PROJECT_SCHEMA_VERSION,
+        "saved_at": datetime.now().isoformat(timespec="seconds"),
+        "results": [normalize_result_item(item) for item in st.session_state.get("results", [])],
+        "bulk_products": st.session_state.get("bulk_products", []),
+        "bulk_selected": st.session_state.get("bulk_selected", {}),
+        "bulk_status": st.session_state.get("bulk_status", {}),
+    }
+
+
+def export_project_json_bytes():
+    return json.dumps(build_project_snapshot(), ensure_ascii=False, indent=2).encode("utf-8")
+
+
+def import_project_json_bytes(raw_bytes):
+    data = json.loads(raw_bytes.decode("utf-8-sig"))
+    if not isinstance(data, dict):
+        raise ValueError("Plik projektu musi zawierać obiekt JSON.")
+    results = data.get("results", [])
+    if not isinstance(results, list):
+        raise ValueError("Nieprawidłowe pole results w pliku projektu.")
+    st.session_state.results = [normalize_result_item(item) for item in results if isinstance(item, dict)]
+    if isinstance(data.get("bulk_products"), list):
+        st.session_state.bulk_products = data.get("bulk_products")
+    if isinstance(data.get("bulk_selected"), dict):
+        st.session_state.bulk_selected = data.get("bulk_selected")
+    if isinstance(data.get("bulk_status"), dict):
+        st.session_state.bulk_status = data.get("bulk_status")
+    return len(st.session_state.results)
+
+
+def export_error_logs_csv_bytes(*logs):
+    rows = []
+    for log_name, entries in logs:
+        for entry in entries or []:
+            rows.append({
+                "log": log_name,
+                "time": entry.get("time", ""),
+                "url": entry.get("url", ""),
+                "stage": entry.get("stage", ""),
+                "status_code": entry.get("status_code", ""),
+                "error": entry.get("error", ""),
+                "waf_vendor": entry.get("waf_vendor", ""),
+                "response_title": entry.get("response_title", ""),
+            })
+    buffer = io.StringIO()
+    writer = csv.DictWriter(
+        buffer,
+        fieldnames=["log", "time", "url", "stage", "status_code", "error", "waf_vendor", "response_title"],
+        delimiter=";",
+        quoting=csv.QUOTE_ALL,
+    )
+    writer.writeheader()
+    for row in rows:
+        writer.writerow(row)
+    return buffer.getvalue().encode("utf-8-sig")
+
+
 # ==============================
 # UI Views
 # ==============================
@@ -5095,7 +5931,7 @@ def tab_links(model, rewrite_mode, rewrite_copy_without_api):
         for idx, url in enumerate(urls, start=1):
             scraped = None
             try:
-                scraped = scrape_product_url(url)
+                scraped = scrape_product_url(url, olek_verify_timeout_seconds=st.session_state.get("olek_verify_timeout_seconds", OLEK_BROWSER_VERIFY_TIMEOUT_SECONDS))
                 scraped = enrich_scraped_with_downloaded_images(scraped, should_download=download_images)
             except Exception as exc:
                 log_scraping_error(url, exc)
@@ -5205,9 +6041,17 @@ def tab_bulk(model, rewrite_mode, rewrite_copy_without_api):
     st.subheader("Bulk (kategoria)")
     gauge_options = ["", "Towar", "Pojazd", "Pojazd dla dzieci"]
     availability_options = ["", "Auto"]
+    shop_presets = {
+        "Brak presetu": "",
+        "Sansa Europe": "https://sansaeurope.pl/",
+        "Olek Motocykle": "https://shop.olekmotocykle.com/produkty,2",
+        "Adidas PL": "https://www.adidas.pl/",
+    }
+    preset = st.selectbox("Preset sklepu", list(shop_presets.keys()), key="bulk_shop_preset")
     c1, c2 = st.columns(2)
     with c1:
-        listing_url = st.text_input("URL listingu", key="bulk_listing_url")
+        default_listing_url = st.session_state.get("bulk_listing_url", "") or shop_presets.get(preset, "")
+        listing_url = st.text_input("URL listingu", value=default_listing_url, key="bulk_listing_url")
         category = st.text_input("Kategoria bazowa / ręczna", key="bulk_category")
         keywords = st.text_input("Słowa kluczowe", key="bulk_keywords")
     with c2:
@@ -5236,16 +6080,21 @@ def tab_bulk(model, rewrite_mode, rewrite_copy_without_api):
     with col1:
         if st.button("Wczytaj produkty", use_container_width=True):
             try:
-                previews, method = scrape_listing_products(listing_url)
+                previews, method = scrape_listing_products(
+                    listing_url,
+                    olek_verify_timeout_seconds=st.session_state.get("olek_verify_timeout_seconds", OLEK_BROWSER_VERIFY_TIMEOUT_SECONDS),
+                )
                 st.session_state.bulk_products = previews
                 st.session_state.bulk_selected = {p['url']: True for p in previews}
+                st.session_state.bulk_status = {p['url']: "loaded" for p in previews}
                 st.info(f"Wykryto {len(previews)} produktów. Metoda: {method}")
             except Exception as exc:
                 st.error(f"Błąd listingu: {safe_str(exc)}")
     with col2:
-        if st.button("Wyczyść listę bulk", use_container_width=True):
-            st.session_state.bulk_products = []
-            st.session_state.bulk_selected = {}
+            if st.button("Wyczyść listę bulk", use_container_width=True):
+                st.session_state.bulk_products = []
+                st.session_state.bulk_selected = {}
+                st.session_state.bulk_status = {}
     if st.session_state.bulk_products:
         s1, s2 = st.columns(2)
         with s1:
@@ -5258,32 +6107,51 @@ def tab_bulk(model, rewrite_mode, rewrite_copy_without_api):
                     st.session_state.bulk_selected[product['url']] = False
         selected_count = 0
         for product in st.session_state.bulk_products:
-            checked = st.checkbox(f"{product.get('title','Bez nazwy')} — {product.get('url')}", value=st.session_state.bulk_selected.get(product['url'], True), key=f"bulk_check_{product['url']}")
+            status = st.session_state.bulk_status.get(product["url"], "loaded")
+            checked = st.checkbox(f"[{status}] {product.get('title','Bez nazwy')} — {product.get('url')}", value=st.session_state.bulk_selected.get(product['url'], True), key=f"bulk_check_{product['url']}")
             st.session_state.bulk_selected[product['url']] = checked
             selected_count += int(bool(checked))
         st.caption(f"Zaznaczonych: {selected_count}")
-        if st.button("Generuj dla zaznaczonych", type="primary", use_container_width=True):
+        b1, b2 = st.columns(2)
+        generate_selected = b1.button("Generuj dla zaznaczonych", type="primary", use_container_width=True)
+        retry_failed = b2.button("Retry błędnych", use_container_width=True)
+        if generate_selected or retry_failed:
             client = None
             if not should_use_local_rewrite_copy(rewrite_mode, rewrite_copy_without_api):
                 client = require_client()
                 if client is None:
                     return
-            chosen = [p for p in st.session_state.bulk_products if st.session_state.bulk_selected.get(p['url'], False)]
+            if retry_failed:
+                chosen = [
+                    p for p in st.session_state.bulk_products
+                    if safe_str(st.session_state.bulk_status.get(p["url"], "")).startswith("error")
+                ]
+            else:
+                chosen = [p for p in st.session_state.bulk_products if st.session_state.bulk_selected.get(p['url'], False)]
+            if not chosen:
+                st.warning("Brak produktów do przetworzenia.")
+                return
             progress = st.progress(0)
             new_results = []
             for idx, preview in enumerate(chosen):
                 scraped = None
                 try:
-                    scraped = scrape_product_url(preview['url'])
+                    st.session_state.bulk_status[preview["url"]] = "scraping"
+                    scraped = scrape_product_url(
+                        preview['url'],
+                        olek_verify_timeout_seconds=st.session_state.get("olek_verify_timeout_seconds", OLEK_BROWSER_VERIFY_TIMEOUT_SECONDS),
+                    )
                     scraped = enrich_scraped_with_downloaded_images(scraped, should_download=download_images)
                 except Exception as exc:
                     log_scraping_error(preview.get("url"), exc)
+                    st.session_state.bulk_status[preview["url"]] = f"error_scraping: {trim_text_excerpt(safe_str(exc), 120)}"
                     st.warning(f"Błąd scrapingu dla {preview.get('url')}: {safe_str(exc)}")
                     progress.progress((idx + 1) / max(len(chosen), 1))
                     continue
                 sku = scraped.get("sku") or (f"{sku_prefix}-{str(int(start_number)+idx).zfill(3)}" if sku_prefix else "")
                 payload = build_generation_payload(scraped, category=category, producer=producer, keywords=keywords, features="", sku_override=sku)
                 try:
+                    st.session_state.bulk_status[preview["url"]] = "generating"
                     generated = generate_with_claude(
                         client,
                         model,
@@ -5305,12 +6173,58 @@ def tab_bulk(model, rewrite_mode, rewrite_copy_without_api):
                             use_full_name_as_product_code=use_full_name_as_product_code,
                         )
                     )
+                    st.session_state.bulk_status[preview["url"]] = "done"
                 except Exception as exc:
                     log_generation_error(preview.get("url"), exc)
+                    st.session_state.bulk_status[preview["url"]] = f"error_generation: {trim_text_excerpt(safe_str(exc), 120)}"
                     st.warning(f"Błąd generowania dla {preview.get('url')}: {safe_str(exc)}")
                 progress.progress((idx + 1) / max(len(chosen), 1))
             append_results(new_results)
             st.success(f"Zakończono generację dla {len(new_results)} produktów.")
+
+
+def render_project_tools():
+    with st.expander("Projekt roboczy", expanded=False):
+        c1, c2 = st.columns(2)
+        with c1:
+            st.download_button(
+                "Zapisz projekt JSON",
+                data=export_project_json_bytes(),
+                file_name=f"generator-chatshoper-projekt-{datetime.now().strftime('%Y%m%d-%H%M')}.json",
+                mime="application/json",
+                use_container_width=True,
+                key="download_project_json",
+            )
+        with c2:
+            uploaded_project = st.file_uploader("Wczytaj projekt JSON", type=["json"], key="upload_project_json")
+            if uploaded_project is not None and st.button("Przywróć projekt", use_container_width=True):
+                try:
+                    count = import_project_json_bytes(uploaded_project.getvalue())
+                    st.success(f"Przywrócono {count} wyników.")
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"Nie udało się wczytać projektu: {safe_str(exc)}")
+
+
+def render_product_preview(item):
+    image_urls = item.get("images") or []
+    with st.expander("Podgląd karty produktu", expanded=False):
+        p1, p2 = st.columns([1, 2])
+        with p1:
+            if image_urls:
+                st.image(image_urls[0], use_container_width=True)
+            else:
+                st.caption("Brak zdjęcia")
+        with p2:
+            st.markdown(f"### {html.escape(safe_str(item.get('name', 'Produkt')))}")
+            price = parse_float(item.get("price"))
+            if price is not None:
+                st.markdown(f"**Cena:** {price:.2f} PLN")
+            st.markdown(f"**Kategoria:** {html.escape(safe_str(item.get('category', '')))}")
+            if item.get("short_description"):
+                st.write(item.get("short_description"))
+        if item.get("description"):
+            st.markdown(item.get("description"), unsafe_allow_html=True)
 
 
 def render_results():
@@ -5353,6 +6267,7 @@ def render_results():
                 item["delivery"] = normalize_delivery_days(delivery_input)
             item["short_description"] = st.text_area("Krótki opis", value=item.get("short_description",""), key=f"short_{suffix}", height=120)
             item["description"] = st.text_area("Opis HTML", value=item.get("description",""), key=f"desc_{suffix}", height=220)
+            render_product_preview(item)
             col1, col2 = st.columns(2)
             with col1:
                 item_price = parse_float(item.get("price"))
@@ -5467,7 +6382,33 @@ def render_results():
                 if item.get("downloaded_images_dir"):
                     st.code(item.get("downloaded_images_dir", ""), language="text")
     st.session_state.results = results
-    csv_data = export_csv_bytes(results)
+    shoper_errors, shoper_warnings = validate_shoper_results(results)
+    if shoper_errors or shoper_warnings:
+        with st.expander("Walidator Shoper", expanded=bool(shoper_errors)):
+            if shoper_errors:
+                st.error(f"Błędy: {len(shoper_errors)}")
+                for error in shoper_errors[:50]:
+                    st.write(f"- {error}")
+            if shoper_warnings:
+                st.warning(f"Ostrzeżenia: {len(shoper_warnings)}")
+                for warning in shoper_warnings[:50]:
+                    st.write(f"- {warning}")
+            st.download_button(
+                "Pobierz raport walidacji Shoper",
+                data=export_shoper_validation_csv_bytes(results),
+                file_name="generator-chatshoper-walidacja-shoper.csv",
+                mime="text/csv",
+                use_container_width=True,
+                key="download_shoper_validation",
+            )
+    st.session_state.csv_encoding = st.selectbox(
+        "Kodowanie CSV Shoper",
+        ["UTF-8 BOM", "UTF-8"],
+        index=0 if st.session_state.get("csv_encoding", "UTF-8 BOM") == "UTF-8 BOM" else 1,
+        key="csv_encoding_select",
+        help="UTF-8 BOM zwykle lepiej otwiera polskie znaki w Excelu i części importerów.",
+    )
+    csv_data = export_csv_bytes(results, encoding=st.session_state.csv_encoding)
     vinted_rows, vinted_errors = build_vinted_export_rows(results)
     if st.session_state.debug_mode:
         with st.expander("Preview eksportu CSV", expanded=False):
@@ -5540,6 +6481,17 @@ def render_debug_panel():
         st.session_state.generation_errors = []
         st.session_state.olek_browser_trace = []
         st.success("Wyczyszczono logi debug.")
+    st.download_button(
+        "Pobierz logi błędów CSV",
+        data=export_error_logs_csv_bytes(
+            ("scraping", st.session_state.scraping_errors),
+            ("generation", st.session_state.generation_errors),
+        ),
+        file_name="generator-chatshoper-bledy.csv",
+        mime="text/csv",
+        use_container_width=True,
+        key="download_error_logs",
+    )
     with st.expander("Log błędów scrapingu", expanded=False):
         if not st.session_state.scraping_errors:
             st.caption("Brak błędów scrapingu.")
@@ -5607,6 +6559,7 @@ def main():
         tab_manual(model, rewrite_mode, rewrite_copy_without_api)
     with tab3:
         tab_bulk(model, rewrite_mode, rewrite_copy_without_api)
+    render_project_tools()
     render_results()
     render_debug_panel()
 
